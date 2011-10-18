@@ -5,6 +5,8 @@
 #include <unistd.h>
 #include <stdarg.h>
 #include <deque>
+#include "pthread.h"
+#include <boost/circular_buffer.hpp>
 #include "libfreenect.h"
 #define PNG_DEBUG 3
 #include <png.h>
@@ -12,25 +14,25 @@
 volatile int die = 0;
 
 uint8_t *rgb_back;
-int f;
+
 
 /* structure to store PNG image bytes */
 struct mem_encode
 {
-	char *buffer;
-	size_t size;
+	char buffer[640*480*2];
+	int size;
 };
-
-mem_encode state;
 
 struct img
 {
 	uint8_t type;
-	uint32_t state;
+	uint32_t timestamp;
 	mem_encode data;
+	int mark;
 };
 
 std::deque<img> imgs;
+std::deque<img> img_cleanup;
 
 void abort_(const char * s, ...)
 {
@@ -49,11 +51,12 @@ my_png_write_data(png_structp png_ptr, png_bytep data, png_size_t length)
 	size_t nsize = p->size + length;
 
 	/* allocate or grow buffer */
+	/*
 	if(p->buffer)
 		p->buffer = (char*)realloc(p->buffer, nsize);
 	else
 		p->buffer = (char*)malloc(nsize);
-
+	*/
 	if(!p->buffer)
 		png_error(png_ptr, "Write Error");
 	/* copy new bytes to end of buffer */
@@ -61,38 +64,28 @@ my_png_write_data(png_structp png_ptr, png_bytep data, png_size_t length)
 	p->size += length;
 }
 
-void encode_thread()
+void write_png_file(void* img, mem_encode* state)
 {
-	while(1)
-	{
-		if(imgs.size() > 0)
-		{
-			img i = imgs.back();
-			imgs.pop_back();
-			
-		}
-	}
-}
-
-void write_png_file(void* img)
-{
-	state.size = 0;
+	state->size = 0;
 	png_structp png_ptr;
 	png_infop info_ptr;
 	int number_of_passes;
-	png_bytep * row_pointers = (png_bytep*)malloc(480 * sizeof(png_bytep));
+
+	png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+
+	png_bytep * row_pointers = (png_bytep*)png_malloc(png_ptr, 480 * sizeof(png_bytep));
 	for(int h = 0; h < 480; ++h)
 	{
-		(row_pointers)[h] = (png_bytep)(img+(h*640*2));
+		(row_pointers)[h] = (png_bytep)((char*)img+(h*640*2));
 	}
 	/* initialize stuff */
-	png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+
 	
 	if (!png_ptr)
 		abort_("[write_png_file] png_create_write_struct failed");
 
 	/* if my_png_flush() is not needed, change the arg to NULL */
-	png_set_write_fn(png_ptr, &state, my_png_write_data, NULL);
+	png_set_write_fn(png_ptr, state, my_png_write_data, NULL);
 		
 	info_ptr = png_create_info_struct(png_ptr);
 	if (!info_ptr)
@@ -124,40 +117,81 @@ void write_png_file(void* img)
 
 	png_write_end(png_ptr, NULL);
 
-	/* cleanup heap allocation */	
-	free(row_pointers);
-	free(info_ptr);
-	free(png_ptr);
+	/* cleanup heap allocation */
+	png_free (png_ptr, row_pointers);
+	png_destroy_write_struct (&png_ptr, &info_ptr);
 }
 
-void depth_cb(freenect_device *dev, void *v_depth, uint32_t timestamp)
+void run_encode(int f)
 {
-	printf("%d\n", timestamp);
-	write_png_file(v_depth);
+	img i = imgs.back();
+	imgs.pop_back();
+
+	mem_encode s;
+	//s.buffer = NULL;
+	write_png_file(i.data.buffer, &s);	
 	msgpack_sbuffer buffer;
 	msgpack_packer pk;
 	msgpack_sbuffer_init(&buffer);
 	msgpack_packer_init(&pk, &buffer, msgpack_sbuffer_write);
 	msgpack_pack_array(&pk, 3);
 	msgpack_pack_int(&pk, 1);
-	msgpack_pack_int(&pk, timestamp);
-	// msgpack_pack_raw(&pk, state.size);
-	// msgpack_pack_raw_body(&pk, state.buffer, state.size);
+	msgpack_pack_int(&pk, i.timestamp);
+	msgpack_pack_raw(&pk, s.size);
+	msgpack_pack_raw_body(&pk, s.buffer, s.size);
 	write(f, buffer.data, buffer.size);
 	msgpack_sbuffer_destroy(&buffer);
+	i.mark = 1;
+	//if(s.buffer)
+	//	free(s.buffer);
+	//delete[](i.data.buffer);
+}
+
+void* encode_thread(void* p)
+{
+	int f;
+	f = open("sleepdata.mpack", O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+	while(1)
+	{
+		if(imgs.size() > 0)
+		{
+			run_encode(f);
+		}
+		sleep(.001);
+	}
+	close(f);
+}
+
+
+void depth_cb(freenect_device *dev, void *v_depth, uint32_t timestamp)
+{
+	printf("%d\n", timestamp);
+	img i;
+	i.mark = 0;
+	//i.data.buffer = new char[640*480*2];
+	memcpy(i.data.buffer, v_depth, 640*480*2);
+	i.data.size = 640*480*2;
+	imgs.push_front(i);
+	/*
+	while(img_cleanup.size() > 0)
+	{
+		img g = img_cleanup.back();
+		img_cleanup.pop_back();
+		delete(g.data.buffer);
+	}
+	*/
 }
 
 void rgb_cb(freenect_device *dev, void *rgb, uint32_t timestamp)
-{
-	
+{	
 }
 
 int main(int argc, char** argv)
 {
-	f = open("sleepdata.mpack", O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-	state.buffer = NULL;
-	state.size = 0;
 
+	pthread_t thread;
+	int rc;
+	pthread_create(&thread, NULL, encode_thread, NULL);
 	freenect_context *f_ctx;
 	freenect_device *f_dev;
 	if (freenect_init(&f_ctx, NULL) < 0) {
@@ -203,7 +237,6 @@ int main(int argc, char** argv)
 
 	freenect_close_device(f_dev);
 	freenect_shutdown(f_ctx);
-	close(f);
 
 	printf("-- done!\n");
 
