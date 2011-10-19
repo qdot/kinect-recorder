@@ -1,14 +1,16 @@
 #include "msgpack.h"
-#include <stdlib.h>
-#include <stdio.h>
-#include <fcntl.h>
 #include <unistd.h>
-#include <stdarg.h>
+#include <fcntl.h>
+#include <cstdlib>
+#include <cstdio>
+#include <cstdarg>
+#include <iostream>
 #include <boost/shared_ptr.hpp>
 #include <boost/shared_array.hpp>
 #include <boost/circular_buffer.hpp>
 #include <boost/thread.hpp>
 #include <boost/array.hpp>
+#include <boost/program_options.hpp>
 #include "libfreenect.h"
 #define PNG_DEBUG 3
 #include <png.h>
@@ -16,6 +18,16 @@
 volatile int die = 0;
 
 void depth_cb(freenect_device *dev, void *v_depth, uint32_t timestamp);
+/* convert struct timeval to ms(milliseconds) */
+uint64_t tv2ms(struct timeval *a) {
+    return ((a->tv_sec * 1000) + (a->tv_usec / 1000));
+}
+
+uint64_t gettimeofday_ms() {
+    struct timeval curr;
+    gettimeofday(&curr, NULL);
+    return tv2ms(&curr);
+}
 
 /* structure to store PNG image bytes */
 struct mem_encode
@@ -32,7 +44,8 @@ struct mem_encode
 struct CameraImage
 {
 	uint8_t type;
-	uint32_t timestamp;
+	uint32_t camera_timestamp;
+	uint64_t os_timestamp;
 	mem_encode raw;
 	mem_encode encoded;
 	int mark;
@@ -75,8 +88,7 @@ my_png_write_data(png_structp png_ptr, png_bytep data, png_size_t length)
 class Encoder
 {
 public:
-	Encoder() :
-		mImgs(boost::circular_buffer<CameraImage>(10))
+	Encoder() 
 	{
 		mFile = open("sleepdata.mpack", O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 	}
@@ -90,21 +102,25 @@ public:
 		
 	virtual void encode()
 	{
+		mImgs = boost::shared_ptr<boost::circular_buffer<CameraImage> >(new boost::circular_buffer<CameraImage>(60));
 		while(1)
 		{
-			if(mImgs.size() == 0)
+			if(mImgs->size() == 0)
+			{
+				usleep(3000);
 				continue;
+			}
 			printf("encoding!\n");
-			CameraImage i = mImgs.back();
-			mImgs.pop_back();
+			CameraImage i = mImgs->back();
+			mImgs->pop_back();
 			encodeImage(i);
 			msgpack_sbuffer buffer;
 			msgpack_packer pk;
 			msgpack_sbuffer_init(&buffer);
 			msgpack_packer_init(&pk, &buffer, msgpack_sbuffer_write);
-			msgpack_pack_array(&pk, 3);
+			msgpack_pack_array(&pk, 4);
 			msgpack_pack_int(&pk, 1);
-			msgpack_pack_int(&pk, i.timestamp);
+			msgpack_pack_int(&pk, i.camera_timestamp);
 			msgpack_pack_raw(&pk, i.encoded.size);
 			msgpack_pack_raw_body(&pk, (void*)i.encoded.buffer.get(), i.encoded.size);
 			write(mFile, buffer.data, buffer.size);
@@ -114,10 +130,10 @@ public:
 	
 	void addImage(CameraImage& ci)
 	{
-		mImgs.push_back(ci);
+		mImgs->push_back(ci);
 	}
 private:
-	boost::circular_buffer<CameraImage> mImgs;
+	boost::shared_ptr<boost::circular_buffer<CameraImage> > mImgs;
 	int mFile;
 };
 
@@ -169,10 +185,6 @@ public:
 		if (!info_ptr)
 			abort_("[write_png_file] png_create_info_struct failed");
 
-		//png_init_io(png_ptr, f);
-		// if (setjmp(png_jmpbuf(png_ptr)))
-		// 	abort_("[write_png_file] Error during init_io");
-	
 		/* write header */
 		if (setjmp(png_jmpbuf(png_ptr)))
 			abort_("[write_png_file] Error during writing header");
@@ -207,6 +219,8 @@ class Camera
 public:
 	Camera()
 	{
+		mLastUpdate = gettimeofday_ms();
+		mFPS = 1000;
 	}
 
 	~Camera()
@@ -215,6 +229,7 @@ public:
 
 	bool initCamera()
 	{
+		
 		if (freenect_init(&f_ctx, NULL) < 0) {
 			printf("freenect_init() failed\n");
 			return false;
@@ -247,7 +262,7 @@ public:
 		boost::thread encoderThread = boost::thread(&Encoder::encode, p);
 		freenect_start_depth(f_dev);
 		while (!die && freenect_process_events(f_ctx) >= 0) {
-			sleep(.01);
+			usleep(1000);
 		}
 	}
 
@@ -265,9 +280,20 @@ public:
 
 	void addImage(uint8_t* buf, uint32_t size, uint32_t timestamp)
 	{
+
+		uint64_t t = gettimeofday_ms();
+		if(((t - mLastUpdate) * .001) > (float)(1.0/mFPS))
+		{
+			mLastUpdate = t;
+		}
+		else
+		{
+			return;
+		}
+		printf("Adding!\n");
 		CameraImage ci;
 		ci.type = 1;
-		ci.timestamp = timestamp;
+		ci.camera_timestamp = timestamp;
 		ci.raw.size = size;
 		ci.raw.buffer = boost::shared_array<uint8_t>(new uint8_t[size]);
 		memcpy((void*)ci.raw.buffer.get(), buf, size);
@@ -279,24 +305,62 @@ public:
 	{
 		p.reset(new T());
 	}
+
+	void setFPS(int f)
+	{
+		mFPS = f;
+	}
 private:
 	freenect_context *f_ctx;
 	freenect_device *f_dev;
 	boost::shared_ptr<Encoder> p;
-
+	int mFPS;
+	uint64_t mLastUpdate;
 };
 
 void depth_cb(freenect_device *dev, void *v_depth, uint32_t timestamp)
 {
-	printf("Adding image!\n");
 	Camera* c = (Camera*)freenect_get_user(dev);
 	c->addImage((uint8_t*)v_depth, 640*480*2, timestamp);
 }
 
 int main(int argc, char** argv)
 {
+	namespace po = boost::program_options;
+	po::options_description desc("options");
+	desc.add_options()
+		("help", "help message")
+		("raw", "use raw")
+		("png", "use png")
+		("fps", po::value<int>(), "fps for recording");
+	po::variables_map vm;
+	po::store(po::parse_command_line(argc, argv, desc), vm);
+	po::notify(vm);    
+
+	if (vm.count("help")) {
+		std::cout << desc << std::endl;
+		return 1;
+	}
+	
 	Camera c;
-	c.setEncoder<PngEncoder>();
+	if(vm.count("raw"))
+	{
+		c.setEncoder<RawEncoder>();
+	}
+	else if (vm.count("png"))
+	{
+		c.setEncoder<PngEncoder>();
+	}
+	else
+	{
+		std::cout << "Encoder type required!" << std::endl;
+		return 1;
+	}
+
+	if(vm.count("fps"))
+	{
+		c.setFPS(vm["fps"].as<int>());
+	}
 	c.initCamera();
 	c.start();
 	c.destroyCamera();
